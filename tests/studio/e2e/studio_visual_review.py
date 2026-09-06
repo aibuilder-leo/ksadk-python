@@ -109,7 +109,10 @@ def main() -> None:
                             assert (
                                 main and main["x"] >= 0 and main["x"] + main["width"] <= width + 1
                             )
-                            page.screenshot(path=str(args.output / f"{theme}-{width}-{name}.png"))
+                            page.screenshot(
+                                path=str(args.output / f"{theme}-{width}-{name}.png"),
+                                animations="disabled",
+                            )
                             checks.append({"theme": theme, "width": width, "page": name})
 
                         for label, name in PAGES:
@@ -123,6 +126,35 @@ def main() -> None:
                                 page.get_by_role("textbox", name="消息").fill("检查窄屏输入与焦点")
                                 expect(page.get_by_role("button", name="发送消息")).to_be_enabled()
                             capture(name)
+                            if name == "agents":
+                                assert_readable(
+                                    page, ".agent-cell-copy strong, .agent-cell-copy > span"
+                                )
+                                trigger = page.get_by_role("combobox", name="筛选 Agent 状态")
+                                trigger.click()
+                                expect(page.locator(".studio-select-content")).to_be_in_viewport(
+                                    ratio=1
+                                )
+                                expect(page.locator(".studio-select-item").first).to_be_focused()
+                                page.keyboard.press("ArrowDown")
+                                expect(page.locator(".studio-select-item").nth(1)).to_be_focused()
+                                page.locator(".studio-select-item").nth(1).hover()
+                                capture("agents-filter")
+                                rows = page.locator(".studio-select-item").all()
+                                assert len(rows) >= 2
+                                boxes = [row.bounding_box() for row in rows]
+                                for index, box in enumerate(boxes):
+                                    assert box and box["height"] >= 40
+                                    assert box["x"] >= 0 and box["y"] >= 0, box
+                                    assert box["x"] + box["width"] <= width, box
+                                    assert box["y"] + box["height"] <= height, box
+                                    if index:
+                                        previous = boxes[index - 1]
+                                        assert previous
+                                        assert box["y"] - previous["y"] - previous["height"] >= 6
+                                assert_readable(page, ".studio-select-item")
+                                page.keyboard.press("Escape")
+                                expect(trigger).to_be_focused()
                         page.locator(".primary-nav").get_by_role(
                             "button", name="工程资源", exact=True
                         ).click()
