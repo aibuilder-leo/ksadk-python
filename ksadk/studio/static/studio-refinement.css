@@ -270,13 +270,22 @@ input, textarea, select, .studio-select-trigger, .studio-multi-select-trigger,
   outline-offset: 3px;
 }
 :is(input, textarea, select):focus,
-.studio-select-trigger:focus-visible,
-.studio-select-trigger[data-state="open"],
-.studio-multi-select-trigger[aria-expanded="true"],
 .search-field:focus-within {
   outline: 2px solid var(--accent-border);
   outline-offset: 1px;
   border-color: var(--accent);
+}
+/* Opening with a pointer needs a border, not a second focus frame. */
+.studio-select-trigger[data-state="open"],
+.studio-multi-select-trigger[aria-expanded="true"] {
+  border-color: var(--accent);
+  outline: none;
+}
+.studio-select-trigger:focus-visible,
+.studio-multi-select-trigger:focus-visible {
+  border-color: var(--accent);
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
 }
 .search-field input:focus { outline: none; }
 input::placeholder, textarea::placeholder { color: var(--text-tertiary); opacity: 1; }
@@ -300,6 +309,39 @@ input::placeholder, textarea::placeholder { color: var(--text-tertiary); opacity
 .chat-approval-menu {
   border-color: var(--border);
   border-radius: var(--radius-surface);
+}
+/* Keep selected and hovered rows visibly separate across shared menus. */
+.studio-select-content {
+  min-width: min(176px, calc(100vw - 24px));
+  max-width: calc(100vw - 24px);
+  padding: 4px;
+}
+.studio-select-viewport { padding: 6px; }
+.more-actions-menu, .composer-action-menu, .composer-command-menu,
+.chat-model-menu, .chat-approval-menu { padding: 10px; }
+.studio-command-list { padding: 10px; }
+.studio-select-item {
+  min-height: 40px;
+  border-radius: var(--radius-control);
+  padding: 8px 34px 8px 12px;
+}
+.more-actions-item, .chat-model-option {
+  min-height: 40px;
+  padding-inline: 12px;
+}
+.studio-select-item + .studio-select-item,
+.more-actions-item + .more-actions-item,
+.composer-action-item + .composer-action-item,
+.chat-model-option + .chat-model-option,
+.chat-approval-option + .chat-approval-option,
+.studio-command-list [cmdk-item] + [cmdk-item],
+.composer-command-menu [cmdk-item] + [cmdk-item] { margin-top: 6px; }
+.composer-command-menu [cmdk-list] { gap: 0; }
+.studio-select-item:focus-visible, .more-actions-item:focus-visible,
+.composer-action-item:focus-visible, .chat-model-option:focus-visible,
+.chat-approval-option:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
 }
 .studio-dialog, .overlay .drawer {
   border-color: var(--border);
