@@ -83,6 +83,7 @@ from ksadk.studio.api_plugin_routes import (
     DSH_UI_SANDBOX_FRAME_PATH,
     register_plugin_routes,
 )
+from ksadk.studio.api_resource_connections import register_resource_connection_routes
 from ksadk.studio.codex_manifest import CodexAgentManifest
 from ksadk.studio.contracts import (
     AgentAppearance,
@@ -2060,6 +2061,7 @@ def create_studio_app(
         runtime_model_catalog=runtime_model_catalog,
     )
     register_memory_routes(app, studio)
+    register_resource_connection_routes(app, studio)
     register_plugin_routes(app, studio)
 
     return app

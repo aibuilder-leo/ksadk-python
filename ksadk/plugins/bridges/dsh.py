@@ -13,6 +13,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import tempfile
@@ -28,7 +29,12 @@ try:
 except ImportError:  # pragma: no cover - DSH production hosts are Unix
     fcntl = None  # type: ignore[assignment]
 
+import yaml
 from pydantic import BaseModel, ConfigDict
+
+from ksadk.plugins.dsh_installation_digest import installation_digest
+
+_COMMAND_TIMEOUT_SECONDS = 120
 
 
 def _to_camel(value: str) -> str:
@@ -93,6 +99,19 @@ class DshProfileProjection(_DshModel):
     host_version: str
 
 
+class DshProfileBuildSnapshot(_DshModel):
+    """Credential-free identity of the actual local profile execution inputs."""
+
+    projection: DshProfileProjection
+    dependency_lock_digest: str
+    installation_digest: str
+
+    @property
+    def digest(self) -> str:
+        payload = json.dumps(self.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
+        return "sha256:" + hashlib.sha256(payload.encode()).hexdigest()
+
+
 class DshBridgeError(RuntimeError):
     """Base failure for one bounded DSH profile operation."""
 
@@ -111,6 +130,10 @@ class DshPluginApprovalRequired(DshBridgeError):
 
 class DshPluginMutationError(DshBridgeError):
     pass
+
+
+class DshProfileRecoveryError(DshPluginMutationError):
+    """The owner must keep run admission suspended until profile recovery."""
 
 
 class _CommandResult(_DshModel):
@@ -508,11 +531,107 @@ class DshProfilePluginBridge:
                 host_version=self.host.version,
             )
 
+    def migrate_to_isolated_layout(self, *, accept_host_permissions: bool = False) -> None:
+        """Migrate a stopped profile; the caller owns Core/admission suspension.
+
+        Keep an independent byte copy for rollback: a frozen reinstall of the
+        old hoisted layout can itself hit the pinned pnpm shutdown defect.
+        """
+        if not accept_host_permissions:
+            raise DshPluginApprovalRequired("Profile migration may run package install scripts")
+        with self._profile_transaction(exclusive=True):
+            self._require_package_mutation_rollback(new_profile_allowed=False)
+            manifest = self._read_manifest()
+            self._verify_source_receipts(manifest, self._read_state(manifest))
+            settings_path = self._profile_root / "pnpm-workspace.yaml"
+            settings = yaml.safe_load(settings_path.read_text(encoding="utf-8"))
+            if not isinstance(settings, dict):
+                raise DshPluginMutationError("Invalid package-manager settings")
+            if settings.get("nodeLinker") == "isolated":
+                self._preflight()
+                return
+            if settings.get("nodeLinker") != "hoisted":
+                raise DshPluginMutationError("Only hoisted profiles can use this migration")
+            modules = self._profile_root / "node_modules"
+            if modules.is_symlink() or not modules.is_dir():
+                raise DshPluginMutationError("Profile installation is not a real directory")
+            # Reject external links before copying, and retain a byte-exact rollback.
+            original_digest = installation_digest(modules)
+            snapshot = self._snapshot()
+            root = tempfile.mkdtemp(prefix=".layout-backup-", dir=self._profile_root)
+            preserve_backup = False
+            try:
+                backup = Path(root) / "node_modules"
+                shutil.copytree(modules, backup, symlinks=True)
+                if installation_digest(backup) != original_digest:
+                    raise DshPluginMutationError("Profile installation backup did not verify")
+                original_files = Path(root) / "profile-files"
+                original_files.mkdir(mode=0o700)
+                for name, content in snapshot.items():
+                    if content is not None:
+                        original_path = original_files / name
+                        original_path.write_bytes(content)
+                        original_path.chmod(0o600)
+                try:
+                    shutil.rmtree(modules)
+                    settings["nodeLinker"] = "isolated"
+                    settings_path.write_text(yaml.safe_dump(settings), encoding="utf-8")
+                    settings_path.chmod(0o600)
+                    self._plugin_command("install", "--frozen-lockfile")
+                    current_lock = (self._profile_root / "pnpm-lock.yaml").read_bytes()
+                    if current_lock != snapshot["pnpm-lock.yaml"]:
+                        raise DshPluginMutationError("Layout migration changed the dependency lock")
+                    # Native reconcile can re-enable previously disabled bundles.
+                    for name in ("package.json", _STATE_FILE):
+                        content = snapshot[name]
+                        path = self._profile_root / name
+                        if content is None:
+                            path.unlink(missing_ok=True)
+                        else:
+                            path.write_bytes(content)
+                            path.chmod(0o600)
+                    self._verify_source_receipts(manifest, self._read_state(manifest))
+                    self._preflight()
+                except BaseException as error:
+                    try:
+                        if modules.is_symlink():
+                            modules.unlink()
+                        elif modules.exists():
+                            shutil.rmtree(modules)
+                        os.replace(backup, modules)
+                        self._rollback(snapshot, error, reinstall=False)
+                    except BaseException as recovery_error:
+                        preserve_backup = True
+                        raise DshProfileRecoveryError(
+                            "Profile layout recovery failed; retain the layout backup for recovery"
+                        ) from recovery_error
+                    raise
+            finally:
+                if not preserve_backup:
+                    shutil.rmtree(root)
+
     def read_client_bundle(self, name: str, *, expected_digest: str) -> bytes:
         """Read one immutable browser artifact after revalidating Profile inventory."""
 
         with self._profile_transaction(exclusive=False):
             return self._read_client_bundle_locked(name, expected_digest=expected_digest)
+
+    def snapshot_for_build(self) -> DshProfileBuildSnapshot:
+        """Capture exact local inputs under the same profile mutation lock."""
+        with self._profile_transaction(exclusive=False):
+            projection = self.project_profile()
+            lock = self._profile_root / "pnpm-lock.yaml"
+            if lock.is_symlink() or not lock.is_file() or lock.stat().st_size > 16 * 1024 * 1024:
+                raise DshPluginMutationError("DSH Build requires a bounded dependency lockfile")
+            return DshProfileBuildSnapshot(
+                projection=projection,
+                dependency_lock_digest="sha256:" + hashlib.sha256(lock.read_bytes()).hexdigest(),
+                installation_digest=installation_digest(self._profile_root / "node_modules"),
+            )
+
+    def verify_build_snapshot(self, expected: DshProfileBuildSnapshot) -> None:
+        if self.snapshot_for_build() != expected:
+            raise DshPluginMutationError("DSH installed profile no longer matches the Build")
 
     def _read_client_bundle_locked(self, name: str, *, expected_digest: str) -> bytes:
         item = self.get_plugin(name)
@@ -623,10 +742,26 @@ class DshProfilePluginBridge:
     def _plugin_command(self, verb: str, value: str) -> _CommandResult:
         self._ensure_started()
         assert self._command is not None
-        return self._invoke(
-            (*self._command, "plugin", "--profile", self._profile, verb, value),
+        initializing = verb == "add" and not self._manifest_path().exists()
+        # The pinned pnpm hoisted linker can start fetch workers after its
+        # shutdown pass during removal. Use its supported isolated layout for
+        # newly owned profiles, without changing an existing profile's policy.
+        options = ("--config.node-linker=isolated",) if initializing else ()
+        result = self._invoke(
+            (*self._command, "plugin", "--profile", self._profile, verb, value, *options),
             cwd=self._cwd,
         )
+        if initializing:
+            settings_path = self._profile_root / "pnpm-workspace.yaml"
+            settings = yaml.safe_load(settings_path.read_text(encoding="utf-8"))
+            if not isinstance(settings, dict):
+                raise DshPluginMutationError("DSH initialized invalid package-manager settings")
+            settings["nodeLinker"] = "isolated"
+            # This is a newly created profile inside the install transaction;
+            # any subsequent failure removes it through the existing rollback.
+            settings_path.write_text(yaml.safe_dump(settings), encoding="utf-8")
+            settings_path.chmod(0o600)
+        return result
 
     def _preflight(self) -> _CommandResult:
         self._ensure_started()
@@ -1022,7 +1157,10 @@ class DshProfilePluginBridge:
                 "existing DSH profile has no pnpm lockfile, so package rollback is unavailable"
             )
 
-    def _rollback(self, snapshot: Mapping[str, bytes | None], original: BaseException) -> None:
+    def _rollback(
+        self, snapshot: Mapping[str, bytes | None], original: BaseException,
+        *, reinstall: bool = True,
+    ) -> None:
         try:
             if all(content is None for content in snapshot.values()):
                 profiles_root = (self._dsh_home / "profiles").resolve()
@@ -1040,7 +1178,10 @@ class DshProfilePluginBridge:
                 else:
                     path.write_bytes(content)
                     path.chmod(0o600)
-            if snapshot.get("pnpm-lock.yaml") is not None and self._manifest_path().is_file():
+            if (
+                reinstall and snapshot.get("pnpm-lock.yaml") is not None
+                and self._manifest_path().is_file()
+            ):
                 self._plugin_command("install", "--frozen-lockfile")
                 for name in ("package.json", _STATE_FILE):
                     content = snapshot.get(name)
@@ -1100,15 +1241,30 @@ class DshProfilePluginBridge:
         environment: Mapping[str, str],
     ) -> _CommandResult:
         try:
-            completed = subprocess.run(
+            process = subprocess.Popen(
                 list(command),
                 cwd=cwd,
                 env=dict(environment),
-                check=False,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=120,
+                start_new_session=os.name == "posix",
             )
+            try:
+                stdout, stderr = process.communicate(timeout=_COMMAND_TIMEOUT_SECONDS)
+            except BaseException:
+                # DSH synchronously waits on pnpm. Stop both before profile
+                # rollback, including when a child still owns the output pipes.
+                if os.name == "posix":
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                else:  # pragma: no cover - supported production hosts are Unix
+                    process.kill()
+                process.communicate()
+                raise
+            completed = subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
         except (OSError, subprocess.TimeoutExpired) as error:
             raise DshHostUnavailableError("DSH host command did not complete") from error
         if completed.returncode != 0:
@@ -1141,6 +1297,7 @@ __all__ = [
     "DshPluginNotFoundError",
     "DshProfilePluginBridge",
     "DshProfileProjection",
+    "DshProfileRecoveryError",
     "dsh_subprocess_environment",
     "validate_dsh_registry_source",
 ]

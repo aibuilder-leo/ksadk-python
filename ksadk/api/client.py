@@ -162,8 +162,30 @@ class AgentEngineClient:
         timeout: float = 60.0,
         dry_run: bool = False,
         extra_headers: Optional[Dict[str, str]] = None,
+        allow_env_fallback: bool = True,
+        api_version: Optional[str] = None,
     ):
-        resolved_base_url = base_url or os.getenv("AGENTENGINE_SERVER_URL")
+        if type(allow_env_fallback) is not bool:
+            raise ValueError("allow_env_fallback must be a boolean")
+        self._allow_env_fallback = allow_env_fallback
+        self._explicit_api_version = api_version
+        if not allow_env_fallback:
+            parsed = urlsplit(base_url or "")
+            parsed.port  # validate malformed or out-of-range ports before any transport
+            if (
+                parsed.scheme not in {"http", "https"} or not parsed.hostname
+                or parsed.username is not None or parsed.password is not None
+                or parsed.query or parsed.fragment or "\\" in (base_url or "")
+                or any(char.isspace() for char in (base_url or ""))
+                or not access_key or not secret_key or not region
+                or region.strip().lower() == "pre-online"
+            ):
+                raise ValueError(
+                    "Explicit control clients require endpoint, credentials and region"
+                )
+        resolved_base_url = base_url or (
+            os.getenv("AGENTENGINE_SERVER_URL") if allow_env_fallback else None
+        )
         self.base_url: str = resolved_base_url or self._detect_default_base_url()
 
         # 本地调试覆盖 (如果需要)
@@ -172,10 +194,12 @@ class AgentEngineClient:
         self.logical_region = region
         self.region = self._normalize_control_region(region)
         self.custom_source = self._resolve_custom_source(region)
-        self.dry_run = bool(dry_run or self._is_global_dry_run_enabled())
+        self.dry_run = bool(dry_run or (allow_env_fallback and self._is_global_dry_run_enabled()))
         self.extra_headers = extra_headers or {}
         # 签名 service 可通过环境变量覆盖（例如 aicp）
-        self.service: str = service or os.getenv("AGENTENGINE_SIGN_SERVICE") or "aicp"
+        self.service: str = service or (
+            os.getenv("AGENTENGINE_SIGN_SERVICE") if allow_env_fallback else None
+        ) or "aicp"
 
         # AWS V4 签名
         self._auth = AWSV4Auth(
@@ -183,6 +207,7 @@ class AgentEngineClient:
             secret_access_key=secret_key or "",
             region=self.region,
             service=self.service,
+            allow_env_fallback=allow_env_fallback,
         )
 
         if self._auth.is_enabled:
@@ -216,6 +241,15 @@ class AgentEngineClient:
             urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
             return False
         return True
+
+    def _request_ssl_verify(self) -> bool:
+        return True if not self._allow_env_fallback else self._ssl_verify_enabled()
+
+    def _request_api_version(self) -> str:
+        return self._explicit_api_version or (
+            os.getenv("AGENTENGINE_API_VERSION", "2024-06-12")
+            if self._allow_env_fallback else "2024-06-12"
+        )
 
     @staticmethod
     def _is_global_dry_run_enabled() -> bool:
@@ -259,6 +293,7 @@ class AgentEngineClient:
     def _get_session(self) -> requests.Session:
         if self._session is None:
             self._session = requests.Session()
+            self._session.trust_env = self._allow_env_fallback
         return self._session
 
     def _get_host(self) -> str:
@@ -421,6 +456,8 @@ class AgentEngineClient:
         )
 
     def _can_retry_with_inner_aicp_endpoint(self, details: Dict[str, Any]) -> bool:
+        if not self._allow_env_fallback:
+            return False
         if not self._is_inner_account_intranet_error(details):
             return False
         parsed = urlparse(self.base_url or "")
@@ -439,7 +476,7 @@ class AgentEngineClient:
         kop_mode = self._is_kop_mode()
         headers = self._build_headers(action=action, kop_mode=kop_mode)
         if kop_mode:
-            version = os.getenv("AGENTENGINE_API_VERSION", "2024-06-12")
+            version = self._request_api_version()
             full_url = f"{self.base_url.rstrip('/')}/?Action={action}&Version={version}"
         else:
             full_url = f"{self.base_url}{path}"
@@ -453,7 +490,7 @@ class AgentEngineClient:
         headers["Accept"] = accept
         if has_files:
             headers.pop("Content-Type", None)
-        version = os.getenv("AGENTENGINE_API_VERSION", "2024-06-12")
+        version = self._request_api_version()
         full_url = (
             f"{self.base_url.rstrip('/')}/?Action={action}&Version={version}"
             if kop_mode
@@ -532,7 +569,7 @@ class AgentEngineClient:
         }
         if kop_mode and action:
             headers["X-Action"] = action
-            headers["X-Version"] = os.getenv("AGENTENGINE_API_VERSION", "2024-06-12")
+            headers["X-Version"] = self._request_api_version()
         if self.custom_source:
             headers["X-KSC-CUSTOM-SOURCE"] = self.custom_source
 
@@ -579,6 +616,10 @@ class AgentEngineClient:
 
     def _get_resolved_identity(self) -> Any:
         """反查身份并缓存到实例。dry-run 只读文件缓存不联网。"""
+        if not self._allow_env_fallback:
+            # Explicit resource admission owns identity resolution and its target.
+            # Never consult a global identity cache or contact an implicit service.
+            return None
         if self._identity_resolve_attempted:
             return self._resolved_identity
         self._identity_resolve_attempted = True
@@ -606,7 +647,9 @@ class AgentEngineClient:
             if key.lower() == "x-ksc-account-id" and str(value or "").strip():
                 return str(value).strip()
         # 2. env KSYUN_ACCOUNT_ID
-        account_id = os.getenv("KSYUN_ACCOUNT_ID", "").strip()
+        account_id = (
+            os.getenv("KSYUN_ACCOUNT_ID", "").strip() if self._allow_env_fallback else ""
+        )
         if account_id:
             return account_id
         # 3. 反查主账号 ID（复用 _get_resolved_identity 的反查，不重复调）
@@ -734,10 +777,16 @@ class AgentEngineClient:
                 headers=headers,
                 auth=self._auth.get_auth(),  # AWS V4 签名
                 timeout=self.timeout,
-                verify=self._ssl_verify_enabled(),
+                verify=self._request_ssl_verify(),
+                allow_redirects=self._allow_env_fallback,
             )
 
             logger.debug(f"Response: {response.status_code}")
+
+            if not self._allow_env_fallback and 300 <= response.status_code < 400:
+                raise AgentEngineAPIError(
+                    response.status_code, "Explicit connection redirect refused"
+                )
 
             if response.status_code < 400:
                 break
@@ -1031,7 +1080,8 @@ class AgentEngineClient:
             headers={"Authorization": f"Bearer {api_key}"},
             json=params,
             timeout=self.timeout,
-            verify=self._ssl_verify_enabled(),
+            verify=self._request_ssl_verify(),
+            allow_redirects=self._allow_env_fallback,
         )
         if response.status_code >= 400:
             raise self._workspace_runtime_error(response)
@@ -1164,7 +1214,8 @@ class AgentEngineClient:
                 headers=headers,
                 auth=self._auth.get_auth(),
                 timeout=self.timeout,
-                verify=self._ssl_verify_enabled(),
+                verify=self._request_ssl_verify(),
+                allow_redirects=self._allow_env_fallback,
             )
             if response.status_code < 400:
                 return response
@@ -1238,7 +1289,8 @@ class AgentEngineClient:
             files=files,
             stream=False,
             timeout=self.timeout,
-            verify=self._ssl_verify_enabled(),
+            verify=self._request_ssl_verify(),
+            allow_redirects=self._allow_env_fallback,
         )
         setattr(response, "_ksadk_workspace_url", url)
         if response.status_code >= 400:
@@ -2582,6 +2634,7 @@ class AgentEngineClient:
             raise AssertionError("dry-run request unexpectedly returned")
 
         session = requests.Session()
+        session.trust_env = self._allow_env_fallback
         response: requests.Response | None = None
         retried_inner_endpoint = False
         try:
@@ -2596,7 +2649,8 @@ class AgentEngineClient:
                     # reasoning before its next SSE chunk.  Bound connection
                     # establishment, not the lifetime of an admitted stream.
                     timeout=(self.timeout, None),
-                    verify=self._ssl_verify_enabled(),
+                    verify=self._request_ssl_verify(),
+                    allow_redirects=self._allow_env_fallback,
                     stream=True,
                 )
                 content_type = str(response.headers.get("content-type") or "").lower()

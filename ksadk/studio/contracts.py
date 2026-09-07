@@ -268,6 +268,13 @@ class NativePluginBinding(ContractModel):
         _reject_clear_runtime_secrets(value, path="pluginBinding.config")
         return value
 
+    @model_validator(mode="after")
+    def validate_platform_resource_config(self) -> "NativePluginBinding":
+        from ksadk.resource_runtime.plugin_config import resource_plugin_config
+
+        resource_plugin_config(self.plugin_ref, self.ecosystem, self.config, enabled=self.enabled)
+        return self
+
 
 class AgentBindings(ContractModel):
     model_profile_id: str | None = None
@@ -294,6 +301,9 @@ class AgentBindings(ContractModel):
         plugin_refs = [binding.plugin_ref for binding in self.plugins if binding.enabled]
         if len(plugin_refs) != len(set(plugin_refs)):
             raise ValueError("启用的插件绑定不能重复 pluginRef")
+        from ksadk.resource_runtime.plugin_config import validate_resource_plugin_bindings
+
+        validate_resource_plugin_bindings(self.plugins)
         return self
 
 
@@ -534,6 +544,27 @@ class AgentSpec(ContractModel):
     memory: MemorySpec = Field(default_factory=MemorySpec)
     security: SecuritySpec = Field(default_factory=SecuritySpec)
     evaluation: EvaluationSpec = Field(default_factory=EvaluationSpec)
+
+    @model_validator(mode="after")
+    def validate_memory_resource_reference(self) -> "AgentSpec":
+        if not self.memory.enabled or not self.memory.provider_ref.startswith("binding://"):
+            return self
+        from ksadk.resource_runtime.plugin_config import resource_plugin_config
+
+        binding_id = self.memory.provider_ref.removeprefix("binding://")
+        for binding in self.bindings.plugins:
+            if not binding.enabled:
+                continue
+            resource = resource_plugin_config(
+                binding.plugin_ref, binding.ecosystem, binding.config, enabled=True
+            )
+            if resource is not None and resource.binding.id == binding_id:
+                if resource.binding.resource.kind != "memory-instance":
+                    raise ValueError("Memory providerRef must reference a memory-instance binding")
+                if self.memory.scopes != ["user"]:
+                    raise ValueError("Platform memory requires explicit scopes: [user]")
+                return self
+        raise ValueError("Memory providerRef references a missing or disabled resource binding")
 
 
 _AGENT_ID_PATTERN = re.compile(r"^[a-z][a-z0-9-]{2,62}$")

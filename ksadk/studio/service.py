@@ -122,6 +122,7 @@ from ksadk.studio.plugin_composition import StudioPluginCompositionCompiler
 from ksadk.studio.plugin_runtime import StudioPluginRuntime
 from ksadk.studio.repository import AgentDraftRepository, BuildRepository, load_yaml_file
 from ksadk.studio.resource_catalog import LocalResourceCatalog
+from ksadk.studio.resource_connections import ResourceConnectionRepository
 from ksadk.studio.run_service import StudioRunService, StudioRunSpec
 from ksadk.studio.runtime_catalog import inspect_runtime_catalog
 from ksadk.studio.runtime_source import materialize_generated_runtime_source
@@ -207,6 +208,12 @@ class StudioService:
         self.drafts = AgentDraftRepository(self.workspace)
         self.catalog = LocalResourceCatalog(self.workspace)
         self.builds = BuildRepository(self.workspace)
+        self.credentials = (
+            credential_resolver
+            or getattr(model_client, "credential_resolver", None)
+            or CredentialResolver(self.workspace)
+        )
+        self.resource_connections = ResourceConnectionRepository(self.workspace, self.credentials)
         self.validator = AgentValidator()
         self.builder = AgentBundleBuilder(
             self.workspace,
@@ -239,6 +246,7 @@ class StudioService:
             resource_catalog=self.catalog,
             draft_repository=self.codex_drafts,
             plugin_snapshot_store=self.codex_plugin_snapshots,
+            resource_connections=self.resource_connections,
             **codex_builder_kwargs,
         )
         self.runtime_executor = runtime_executor or RuntimeExecutor(
@@ -250,11 +258,6 @@ class StudioService:
             event_store=self.event_store,
             session_service=self.session_service,
             runtime_events=self.runtime_events,
-        )
-        self.credentials = (
-            credential_resolver
-            or getattr(model_client, "credential_resolver", None)
-            or CredentialResolver(self.workspace)
         )
         self.codex_runs = CodexRunSpecResolver(
             self.workspace,
@@ -355,7 +358,12 @@ class StudioService:
                 await self.reset_dsh_capability_state()
                 try:
                     result = await operation()
-                except BaseException:
+                except BaseException as mutation_error:
+                    if (
+                        isinstance(mutation_error, StudioError)
+                        and mutation_error.code == "DSH_PROFILE_RECOVERY_REQUIRED"
+                    ):
+                        raise
                     try:
                         await self._bind_dsh_provider_registrations_locked(refresh=True)
                         await self._refresh_dsh_catalog_resource(required=False)
@@ -1808,6 +1816,37 @@ class StudioService:
         if self.is_codex_agent(agent_id):
             return detail["validation"]
         return self.validator.validate(draft, level=level)
+
+    async def resource_binding_status(self, agent_id: str, *, activation_id: str) -> dict:
+        # Check workspace ownership, but never project the mutable draft as runtime state.
+        await asyncio.to_thread(self.agent_detail, agent_id)
+        status = await self.dsh_capabilities.resource_runtime_status(
+            agent_id=agent_id, activation_id=activation_id,
+        )
+        if status is None:
+            raise StudioError(
+                "RESOURCE_ACTIVATION_NOT_FOUND", "未找到此 Agent 的资源运行实例",
+                status_code=404,
+            )
+        return status
+
+    def validate_resource_bindings(self, agent_id: str, *, expected_revision: int) -> dict:
+        from ksadk.studio.resource_binding_validation import resource_binding_diagnostics
+
+        draft = self.agent_detail(agent_id)["draft"]
+        if draft.metadata.revision != expected_revision:
+            raise StudioError(
+                "AGENT_REVISION_CONFLICT", "资源校验版本与当前 Agent 不一致", status_code=409,
+            )
+        diagnostics = resource_binding_diagnostics(
+            draft.spec.bindings.plugins, draft.spec.memory, self.resource_connections,
+        )
+        return {
+            "revision": draft.metadata.revision,
+            "valid": not any(item.severity == "error" for item in diagnostics),
+            "authorizationVerified": False,
+            "diagnostics": [item.model_dump(by_alias=True, mode="json") for item in diagnostics],
+        }
 
     def submit_studio_build(
         self,

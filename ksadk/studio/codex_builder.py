@@ -39,6 +39,8 @@ from ksadk.studio.codex_plugin_store import (
 )
 from ksadk.studio.contracts import ContractModel, ModelSpec
 from ksadk.studio.errors import StudioError, not_found
+from ksadk.studio.resource_binding_validation import resource_binding_diagnostics
+from ksadk.studio.resource_connections import ResourceConnectionRepository
 from ksadk.studio.workspace import Workspace
 from ksadk.version import VERSION as SDK_VERSION
 
@@ -278,6 +280,7 @@ class CodexStudioBuilder:
         resource_catalog: Any = None,
         draft_repository: Any = None,
         plugin_snapshot_store: CodexPluginSnapshotStore | None = None,
+        resource_connections: ResourceConnectionRepository | None = None,
     ) -> None:
         self.workspace = workspace
         self.manifests = manifest_repository or CodexManifestRepository(workspace)
@@ -286,6 +289,7 @@ class CodexStudioBuilder:
         self.catalog = resource_catalog
         self.drafts = draft_repository
         self.plugin_snapshots = plugin_snapshot_store or CodexPluginSnapshotStore(workspace)
+        self.resource_connections = resource_connections
 
     def build(
         self,
@@ -294,6 +298,19 @@ class CodexStudioBuilder:
         source_revision: int = 1,
     ) -> CodexBuildRecord:
         snapshot = self.manifests.load(agent_id)
+        if self.resource_connections is not None:
+            diagnostics = resource_binding_diagnostics(
+                snapshot.manifest.plugins or [], snapshot.manifest.memory,
+                self.resource_connections,
+            )
+            if any(item.severity == "error" for item in diagnostics):
+                raise StudioError(
+                    "RESOURCE_BINDING_VALIDATION_FAILED", "资源连接或策略校验失败",
+                    status_code=422,
+                    details={
+                        "diagnostics": [item.model_dump(by_alias=True) for item in diagnostics]
+                    },
+                )
         model_profiles = self._model_profile_snapshot(
             snapshot.manifest.name,
             allowed_models=snapshot.manifest.allowed_models,
