@@ -277,11 +277,6 @@ input, textarea, select, .studio-select-trigger, .studio-multi-select-trigger,
   background: var(--surface);
   outline: none;
 }
-.studio-select-trigger:hover:not(:disabled),
-.studio-multi-select-trigger:hover:not(:disabled) {
-  background: var(--surface);
-  border-color: var(--brand);
-}
 .app-shell :is(button, a, [role="tab"], [role="combobox"]):focus-visible,
 .overlay :is(button, a, [role="tab"], [role="combobox"]):focus-visible {
   outline: 2px solid var(--focus-ring);
@@ -293,17 +288,22 @@ input, textarea, select, .studio-select-trigger, .studio-multi-select-trigger,
   outline-offset: 1px;
   border-color: var(--accent);
 }
-/* Opening with a pointer needs a border, not a second focus frame. */
+/* Selection controls use a background change instead of an accent frame. */
+.studio-select-trigger:hover:not(:disabled),
+.studio-multi-select-trigger:hover:not(:disabled),
 .studio-select-trigger[data-state="open"],
-.studio-multi-select-trigger[aria-expanded="true"] {
-  border-color: var(--accent);
+.studio-multi-select-trigger[aria-expanded="true"],
+select:hover:not(:disabled), select:focus {
+  background: var(--surface-hover);
+  border-color: var(--border-strong);
   outline: none;
 }
 .studio-select-trigger:focus-visible,
-.studio-multi-select-trigger:focus-visible {
-  border-color: var(--accent);
-  outline: 2px solid var(--focus-ring);
-  outline-offset: 3px;
+.studio-multi-select-trigger:focus-visible,
+:is(.app-shell, .overlay) :is(.studio-select-trigger, .studio-multi-select-trigger):focus-visible {
+  background: var(--accent-soft);
+  border-color: var(--border-strong);
+  outline: none;
 }
 .search-field input:focus { outline: none; }
 input::placeholder, textarea::placeholder { color: var(--text-tertiary); opacity: 1; }
@@ -403,8 +403,7 @@ input::placeholder, textarea::placeholder { color: var(--text-tertiary); opacity
 .studio-select-item:focus-visible, .more-actions-item:focus-visible,
 .composer-action-item:focus-visible, .chat-model-option:focus-visible,
 .chat-approval-option:focus-visible {
-  outline: 2px solid var(--focus-ring);
-  outline-offset: -2px;
+  outline: none;
 }
 .studio-dialog, .overlay .drawer {
   border-color: var(--border);
